@@ -675,9 +675,6 @@ class GLES2DecoderImpl : public GLES2Decoder,
   // Implements GpuSwitchingObserver.
   void OnGpuSwitched() override;
 
-  // Bind the framebuffer `fbo` and perform any workarounds needed.
-  void BindFramebuffer(unsigned target, uint32_t service_id) const override;
-
   // Restores the current state to the user's settings.
   void RestoreCurrentFramebufferBindings();
 
@@ -2421,10 +2418,6 @@ class GLES2DecoderImpl : public GLES2Decoder,
   // Backbuffer attachments that are currently undefined.
   uint32_t backbuffer_needs_clear_bits_;
 
-  // An always-complete FBO to use for workarounds
-  GLuint complete_fbo_ = 0;
-  GLuint complete_fbo_color_texture_ = 0;
-
   // The current decoder error communicates the decoder error through command
   // processing functions that do not return the error value. Should be set only
   // if not returning an error.
@@ -2601,7 +2594,7 @@ ScopedFramebufferBinder::ScopedFramebufferBinder(GLES2DecoderImpl* decoder,
     : decoder_(decoder) {
   ScopedGLErrorSuppressor suppressor("ScopedFramebufferBinder::ctor",
                                      decoder_->error_state_.get());
-  decoder->BindFramebuffer(GL_FRAMEBUFFER, id);
+  decoder->api()->glBindFramebufferEXTFn(GL_FRAMEBUFFER, id);
   decoder->OnFboChanged();
 }
 
@@ -2987,26 +2980,7 @@ gpu::ContextResult GLES2DecoderImpl::Initialize(
     return gpu::ContextResult::kFatalFailure;
   }
 
-  if (workarounds().ensure_previous_framebuffer_not_deleted) {
-    // Use a 1x1 RGBA8 framebuffer as the "always complete" framebuffer to bind
-    // before binding other framebuffers
-    api()->glGenTexturesFn(1, &complete_fbo_color_texture_);
-    api()->glBindTextureFn(GL_TEXTURE_2D, complete_fbo_color_texture_);
-    api()->glTexImage2DFn(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA,
-                          GL_UNSIGNED_BYTE, nullptr);
-
-    api()->glGenFramebuffersEXTFn(1, &complete_fbo_);
-    api()->glBindFramebufferEXTFn(GL_FRAMEBUFFER, complete_fbo_);
-    api()->glFramebufferTexture2DEXTFn(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                                       GL_TEXTURE_2D,
-                                       complete_fbo_color_texture_, 0);
-    CHECK_EQ(api()->glCheckFramebufferStatusEXTFn(GL_FRAMEBUFFER),
-             static_cast<GLenum>(GL_FRAMEBUFFER_COMPLETE));
-  }
-  CHECK_GL_ERROR();
-
-  auto result = group_->InitializeWithCompleteFramebufferForWorkarounds(
-      this, context_type, complete_fbo_);
+  auto result = group_->Initialize(this, context_type);
   if (result != gpu::ContextResult::kSuccess) {
     // Must not destroy ContextGroup if it is not initialized.
     group_ = nullptr;
@@ -3142,7 +3116,7 @@ gpu::ContextResult GLES2DecoderImpl::Initialize(
     state_.viewport_width = initial_size.width();
     state_.viewport_height = initial_size.height();
   } else {
-    BindFramebuffer(GL_FRAMEBUFFER, GetBackbufferServiceId());
+    api()->glBindFramebufferEXTFn(GL_FRAMEBUFFER, GetBackbufferServiceId());
     // These are NOT if the back buffer has these proprorties. They are
     // if we want the command buffer to enforce them regardless of what
     // the real backbuffer is assuming the real back buffer gives us more than
@@ -3835,7 +3809,7 @@ void GLES2DecoderImpl::DeleteFramebuffersHelper(
         if (workarounds().unbind_attachments_on_bound_render_fbo_delete)
           framebuffer->DoUnbindGLAttachmentsForWorkaround(target);
 
-        BindFramebuffer(target, GetBackbufferServiceId());
+        api()->glBindFramebufferEXTFn(target, GetBackbufferServiceId());
         state_.UpdateWindowRectanglesForBoundDrawFramebufferClientID(0);
         framebuffer_state_.bound_draw_framebuffer = nullptr;
         framebuffer_state_.clear_state_dirty = true;
@@ -3843,7 +3817,7 @@ void GLES2DecoderImpl::DeleteFramebuffersHelper(
       if (framebuffer == framebuffer_state_.bound_read_framebuffer.get()) {
         framebuffer_state_.bound_read_framebuffer = nullptr;
         GLenum target = GetReadFramebufferTarget();
-        BindFramebuffer(target, GetBackbufferServiceId());
+        api()->glBindFramebufferEXTFn(target, GetBackbufferServiceId());
       }
       OnFboChanged();
       RemoveFramebuffer(client_id);
@@ -3991,32 +3965,33 @@ void GLES2DecoderImpl::ProcessFinishedAsyncTransfers() {
   ProcessPendingReadPixels(false);
 }
 
+static void RebindCurrentFramebuffer(gl::GLApi* api,
+                                     GLenum target,
+                                     Framebuffer* framebuffer,
+                                     GLuint back_buffer_service_id) {
+  GLuint framebuffer_id = framebuffer ? framebuffer->service_id() : 0;
+
+  if (framebuffer_id == 0) {
+    framebuffer_id = back_buffer_service_id;
+  }
+
+  api->glBindFramebufferEXTFn(target, framebuffer_id);
+}
+
 void GLES2DecoderImpl::RestoreCurrentFramebufferBindings() {
   framebuffer_state_.clear_state_dirty = true;
 
-  auto rebind_current_framebuffer = [this](GLenum target,
-                                           Framebuffer* framebuffer,
-                                           GLuint back_buffer_service_id) {
-    GLuint framebuffer_id = framebuffer ? framebuffer->service_id() : 0;
-
-    if (framebuffer_id == 0) {
-      framebuffer_id = back_buffer_service_id;
-    }
-
-    BindFramebuffer(target, framebuffer_id);
-  };
-
   if (!SupportsSeparateFramebufferBinds()) {
-    rebind_current_framebuffer(GL_FRAMEBUFFER,
-                               framebuffer_state_.bound_draw_framebuffer.get(),
-                               GetBackbufferServiceId());
+    RebindCurrentFramebuffer(api(), GL_FRAMEBUFFER,
+                             framebuffer_state_.bound_draw_framebuffer.get(),
+                             GetBackbufferServiceId());
   } else {
-    rebind_current_framebuffer(GL_READ_FRAMEBUFFER,
-                               framebuffer_state_.bound_read_framebuffer.get(),
-                               GetBackbufferServiceId());
-    rebind_current_framebuffer(GL_DRAW_FRAMEBUFFER,
-                               framebuffer_state_.bound_draw_framebuffer.get(),
-                               GetBackbufferServiceId());
+    RebindCurrentFramebuffer(api(), GL_READ_FRAMEBUFFER,
+                             framebuffer_state_.bound_read_framebuffer.get(),
+                             GetBackbufferServiceId());
+    RebindCurrentFramebuffer(api(), GL_DRAW_FRAMEBUFFER,
+                             framebuffer_state_.bound_draw_framebuffer.get(),
+                             GetBackbufferServiceId());
   }
   OnFboChanged();
 }
@@ -4405,16 +4380,6 @@ void GLES2DecoderImpl::OnGpuSwitched() {
   client()->OnGpuSwitched();
 }
 
-void GLES2DecoderImpl::BindFramebuffer(unsigned target,
-                                       uint32_t service_id) const {
-  if (workarounds().ensure_previous_framebuffer_not_deleted) {
-    DCHECK(complete_fbo_);
-    api()->glBindFramebufferEXTFn(target, complete_fbo_);
-  }
-
-  api()->glBindFramebufferEXTFn(target, service_id);
-}
-
 void GLES2DecoderImpl::Destroy(bool have_context) {
   if (!initialized())
     return;
@@ -4464,13 +4429,6 @@ void GLES2DecoderImpl::Destroy(bool have_context) {
       offscreen_target_frame_buffer_->Destroy();
     if (offscreen_target_color_texture_.get())
       offscreen_target_color_texture_->Destroy();
-
-    if (complete_fbo_color_texture_) {
-      api()->glDeleteTexturesFn(1, &complete_fbo_color_texture_);
-    }
-    if (complete_fbo_) {
-      api()->glDeleteFramebuffersEXTFn(1, &complete_fbo_);
-    }
   } else {
     if (offscreen_target_frame_buffer_.get())
       offscreen_target_frame_buffer_->Invalidate();
@@ -5100,13 +5058,13 @@ void GLES2DecoderImpl::RestoreFramebufferBindings() const {
           ? framebuffer_state_.bound_draw_framebuffer->service_id()
           : GetBackbufferServiceId();
   if (!SupportsSeparateFramebufferBinds()) {
-    BindFramebuffer(GL_FRAMEBUFFER, service_id);
+    api()->glBindFramebufferEXTFn(GL_FRAMEBUFFER, service_id);
   } else {
-    BindFramebuffer(GL_DRAW_FRAMEBUFFER, service_id);
+    api()->glBindFramebufferEXTFn(GL_DRAW_FRAMEBUFFER, service_id);
     service_id = framebuffer_state_.bound_read_framebuffer.get()
                      ? framebuffer_state_.bound_read_framebuffer->service_id()
                      : GetBackbufferServiceId();
-    BindFramebuffer(GL_READ_FRAMEBUFFER, service_id);
+    api()->glBindFramebufferEXTFn(GL_READ_FRAMEBUFFER, service_id);
   }
   OnFboChanged();
 }
@@ -5247,7 +5205,7 @@ void GLES2DecoderImpl::DoBindFramebuffer(GLenum target, GLuint client_id) {
     service_id = GetBackbufferServiceId();
   }
 
-  BindFramebuffer(target, service_id);
+  api()->glBindFramebufferEXTFn(target, service_id);
   OnFboChanged();
 }
 
@@ -7018,7 +6976,8 @@ void GLES2DecoderImpl::ClearUnclearedAttachments(
     if (target == GL_READ_FRAMEBUFFER && draw_framebuffer != framebuffer) {
       // TODO(zmo): There is no guarantee that an FBO that is complete on the
       // READ attachment will be complete as a DRAW attachment.
-      BindFramebuffer(GL_DRAW_FRAMEBUFFER, framebuffer->service_id());
+      api()->glBindFramebufferEXTFn(GL_DRAW_FRAMEBUFFER,
+                                    framebuffer->service_id());
     }
     state_.SetDeviceColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     state_.SetDeviceCapabilityState(GL_SCISSOR_TEST, false);
@@ -7065,7 +7024,8 @@ void GLES2DecoderImpl::ClearUnclearedAttachments(
         target == GL_READ_FRAMEBUFFER && draw_framebuffer != framebuffer) {
       // TODO(zmo): There is no guarantee that an FBO that is complete on the
       // READ attachment will be complete as a DRAW attachment.
-      BindFramebuffer(GL_DRAW_FRAMEBUFFER, framebuffer->service_id());
+      api()->glBindFramebufferEXTFn(GL_DRAW_FRAMEBUFFER,
+                                    framebuffer->service_id());
     }
     state_.SetDeviceCapabilityState(GL_SCISSOR_TEST, false);
     ClearDeviceWindowRectangles();
@@ -7083,7 +7043,7 @@ void GLES2DecoderImpl::ClearUnclearedAttachments(
     if (target == GL_READ_FRAMEBUFFER && draw_framebuffer != framebuffer) {
       GLuint service_id = draw_framebuffer ? draw_framebuffer->service_id() :
                                              GetBackbufferServiceId();
-      BindFramebuffer(GL_DRAW_FRAMEBUFFER, service_id);
+      api()->glBindFramebufferEXTFn(GL_DRAW_FRAMEBUFFER, service_id);
     }
   }
 
@@ -7940,8 +7900,7 @@ void GLES2DecoderImpl::RenderbufferStorageMultisampleHelperAMD(
 
 bool GLES2DecoderImpl::RegenerateRenderbufferIfNeeded(
     Renderbuffer* renderbuffer) {
-  if (!renderbuffer->RegenerateAndBindBackingObjectIfNeeded(this,
-                                                            workarounds())) {
+  if (!renderbuffer->RegenerateAndBindBackingObjectIfNeeded(workarounds())) {
     return false;
   }
 
@@ -12100,7 +12059,7 @@ bool GLES2DecoderImpl::ClearLevelUsingGL(Texture* texture,
   GLenum fb_target = GetDrawFramebufferTarget();
   GLuint fb = 0;
   api()->glGenFramebuffersEXTFn(1, &fb);
-  BindFramebuffer(fb_target, fb);
+  api()->glBindFramebufferEXTFn(fb_target, fb);
 
   bool have_color = (channels & GLES2Util::kRGBA) != 0;
   if (have_color) {
@@ -12143,7 +12102,7 @@ bool GLES2DecoderImpl::ClearLevelUsingGL(Texture* texture,
   Framebuffer* framebuffer = GetFramebufferInfoForTarget(fb_target);
   GLuint fb_service_id =
       framebuffer ? framebuffer->service_id() : GetBackbufferServiceId();
-  BindFramebuffer(fb_target, fb_service_id);
+  api()->glBindFramebufferEXTFn(fb_target, fb_service_id);
   return result;
 }
 
@@ -14622,9 +14581,8 @@ error::Error GLES2DecoderImpl::HandleGetRequestableExtensionsCHROMIUM(
       new FeatureInfo(workarounds(), group_->gpu_feature_info()));
   DisallowedFeatures disallowed_features = feature_info_->disallowed_features();
   disallowed_features.AllowExtensions();
-  info->InitializeWithCompleteFramebufferForWorkarounds(
-      feature_info_->context_type(), false /* is_passthrough_cmd_decoder */,
-      disallowed_features, complete_fbo_);
+  info->Initialize(feature_info_->context_type(),
+                   false /* is_passthrough_cmd_decoder */, disallowed_features);
   bucket->SetFromString(gfx::MakeExtensionString(info->extensions()).c_str());
   return error::kNoError;
 }

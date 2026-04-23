@@ -22,7 +22,6 @@
 
 namespace gpu {
 class GpuDriverBugWorkarounds;
-class DecoderContext;
 
 namespace gles2 {
 
@@ -80,7 +79,6 @@ class GPU_GLES2_EXPORT Renderbuffer : public base::RefCounted<Renderbuffer> {
   // Regenerates the object backing this client_id, creating a new service_id.
   // Also reattaches any framebuffers using this renderbuffer.
   bool RegenerateAndBindBackingObjectIfNeeded(
-      const DecoderContext* decoder,
       const GpuDriverBugWorkarounds& workarounds);
 
   void AddFramebufferAttachmentPoint(Framebuffer* framebuffer,
