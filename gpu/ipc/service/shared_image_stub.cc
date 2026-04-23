@@ -308,9 +308,9 @@ void SharedImageStub::OnCreateSharedImageWithData(
       memory.subspan(params->pixel_data_offset, params->pixel_data_size);
 
   if (!factory_->CreateSharedImage(
-          params->mailbox, params->si_info->meta.format,
-          params->si_info->meta.size, params->si_info->meta.color_space,
-          params->si_info->meta.surface_origin,
+          params->mailbox, params->si_info->meta.format,	 
+          params->si_info->meta.size, params->si_info->meta.color_space,	 
+          params->si_info->meta.surface_origin, 
           params->si_info->meta.alpha_type, params->si_info->meta.usage,
           GetLabel(params->si_info->debug_label), subspan)) {
     LOG(ERROR) << kSICreationFailureError;
